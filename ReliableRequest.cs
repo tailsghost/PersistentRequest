@@ -1,115 +1,137 @@
-﻿using System.Threading;
-
-namespace ReliableRequestLib;
+﻿namespace ReliableRequestLib;
 
 public class ReliableRequest
 {
-    private readonly string _url;
-    private readonly int _maxAttempts;
-    private readonly HttpClient _httpClient;
+    private readonly HttpClient _httpClient = new();
 
-
-    public ReliableRequest(string url, int timeout, int maxAttempts)
+    public async Task<bool> PostAsync(string url, int timeout, int maxAttempts, string data = "", HttpRequestMessage message = null, Action<string> logs = null)
     {
-        if(string.IsNullOrWhiteSpace(url))
-            throw new ArgumentNullException("url не может быть пустой!", nameof(url));
-        if (timeout <= 0)
-            throw new ArgumentOutOfRangeException("Timeout должен быть положительным числом.", nameof(timeout));
-        if(maxAttempts <=0)
-            throw new ArgumentOutOfRangeException("Количество попыток должно быть больше 0",nameof(maxAttempts));
+        if (!CheckValidParameters(url, timeout, maxAttempts, logs))
+            return false;
 
-        _url = url;
-        _maxAttempts = maxAttempts;
-
-        _httpClient = new HttpClient
-        {
-            Timeout = TimeSpan.FromMicroseconds(timeout)
-        };
-    }
-
-
-    public async Task<bool> PostAsync(string data, HttpRequestMessage message = null, Action<string> logs = null)
-    {
-        for (var attempt = 1; attempt <= _maxAttempts; attempt++)
+        for (var attempt = 1; attempt <= maxAttempts; attempt++)
         {
             try
             {
-                HttpRequestMessage request;
+                using var cts = new CancellationTokenSource(timeout);
+                using var request = message != null ? CloneRequest(message, url) : new HttpRequestMessage(HttpMethod.Post, url);
 
-                if (message != null)
+                if (!string.IsNullOrEmpty(data) && request.Content == null)
                 {
-                    request = new HttpRequestMessage(HttpMethod.Post, _url);
-
-                    foreach (var header in message.Headers)
-                    {
-                        request.Headers.TryAddWithoutValidation(header.Key, header.Value);
-                    }
-
-                    request.Content = message.Content ?? new StringContent(data);
+                    request.Content = new StringContent(data);
                 }
-                else
-                {
-                    request = new HttpRequestMessage(HttpMethod.Post, _url)
-                    {
-                        Content = new StringContent(data)
-                    };
 
-                    var response = await _httpClient.SendAsync(request);
-
-                    return response.IsSuccessStatusCode;
-                }
+                var response = await _httpClient.SendAsync(request, cts.Token);
+                return response.IsSuccessStatusCode;
             }
-
+            catch (TaskCanceledException)
+            {
+                logs?.Invoke($"Запрос превысил таймаут {timeout} мс.");
+            }
             catch (Exception ex)
             {
-                if (logs != null)
-                    logs(ex.Message);
+                logs?.Invoke($"Ошибка: {ex.Message}");
             }
 
-            if (attempt >= _maxAttempts) continue;
-
-            logs($"Попытка отправить данные {attempt}");
-            await Task.Delay(250);
+            if (attempt < maxAttempts)
+            {
+                logs?.Invoke($"Попытка {attempt} не удалась, повтор через 250 мс...");
+                await Task.Delay(250);
+            }
         }
 
         return false;
     }
 
-    public async Task<bool> GetAsync(HttpRequestMessage message = null, Action<string> logs = null)
+    public async Task<bool> GetAsync(string url, int timeout, int maxAttempts, HttpRequestMessage message = null, Action<string> logs = null)
     {
-        for (var attempt = 1; attempt <= _maxAttempts; attempt++)
+        var response = await _SendRequestAsync(url, timeout, maxAttempts, message, logs);
+        return response?.IsSuccessStatusCode ?? false;
+    }
+
+    public async Task<byte[]> GetAsyncBytes(string url, int timeout, int maxAttempts, HttpRequestMessage message = null, Action<string> logs = null)
+    {
+        var response = await _SendRequestAsync(url, timeout, maxAttempts, message, logs);
+        return response != null && response.IsSuccessStatusCode ? await response.Content.ReadAsByteArrayAsync() : null;
+    }
+
+    private async Task<HttpResponseMessage> _SendRequestAsync(string url, int timeout, int maxAttempts, HttpRequestMessage message, Action<string> logs)
+    {
+        if (!CheckValidParameters(url, timeout, maxAttempts, logs))
+            return null;
+
+        for (var attempt = 1; attempt <= maxAttempts; attempt++)
         {
             try
             {
-                HttpRequestMessage request;
-                if (message != null)
-                {
-                    request = new HttpRequestMessage(HttpMethod.Get, _url);
+                using var cts = new CancellationTokenSource(timeout);
+                using var request = message != null ? CloneRequest(message, url) : new HttpRequestMessage(HttpMethod.Get, url);
 
-                    foreach (var header in message.Headers)
-                    {
-                        request.Headers.TryAddWithoutValidation(header.Key, header.Value);
-                    }
-                }
-                else
-                {
-                    request = new HttpRequestMessage(HttpMethod.Get, _url);
-                }
-
-                var response = await _httpClient.SendAsync(request);
-                return response.IsSuccessStatusCode;
+                var response = await _httpClient.SendAsync(request, cts.Token);
+                if (response.IsSuccessStatusCode)
+                    return response;
+            }
+            catch (TaskCanceledException)
+            {
+                logs?.Invoke($"Запрос превысил таймаут {timeout} мс.");
             }
             catch (Exception ex)
             {
-                if (logs != null)
-                    logs(ex.Message);
+                logs?.Invoke($"Ошибка: {ex.Message}");
             }
 
-            if (attempt >= _maxAttempts) continue;
-            logs($"Попытка отправить данные {attempt}");
-            await Task.Delay(250);
-
+            if (attempt < maxAttempts)
+            {
+                logs?.Invoke($"Попытка {attempt} не удалась, повтор через 250 мс...");
+                await Task.Delay(250);
+            }
         }
+
+        return null;
+    }
+
+    private bool CheckValidParameters(string url, int timeout, int maxAttempts, Action<string> logs = null)
+    {
+        if (string.IsNullOrWhiteSpace(url))
+        {
+            var message = "Url не может быть пустым!";
+            if (logs == null) throw new ArgumentNullException(nameof(url), message);
+            logs(message);
+            return false;
+        }
+
+        if (timeout <= 0)
+        {
+            var message = "Timeout должен быть положительным числом.";
+            if (logs == null) throw new ArgumentOutOfRangeException(nameof(timeout), message);
+            logs(message);
+            return false;
+        }
+
+        if (maxAttempts <= 0)
+        {
+            var message = "Количество попыток должно быть больше 0.";
+            if (logs == null) throw new ArgumentOutOfRangeException(nameof(maxAttempts), message);
+            logs(message);
+            return false;
+        }
+
+        return true;
+    }
+
+    private HttpRequestMessage CloneRequest(HttpRequestMessage original, string url)
+    {
+        var request = new HttpRequestMessage(original.Method, url);
+        foreach (var header in original.Headers)
+        {
+            request.Headers.TryAddWithoutValidation(header.Key, header.Value);
+        }
+
+        if (original.Content != null)
+        {
+            request.Content = new StringContent(original.Content.ReadAsStringAsync().Result);
+        }
+
+        return request;
     }
 }
-
